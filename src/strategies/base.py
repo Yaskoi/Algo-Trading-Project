@@ -1,10 +1,12 @@
+from __future__ import annotations
 from abc import ABC, abstractmethod
 
-class Strategy(ABC):
+
+class BaseStrategy(ABC):
     @abstractmethod
-    def on_bar(self, t, row, history):
+    def on_bar(self, ts, open_: float, high: float, low: float, close: float) -> float:
         """
-        Returns target_position in {-1,0,1} (baseline) or float sizing.
-        history: df.iloc[:current_index+1]
+        Return desired position AFTER observing bar close:
+        -1 short, 0 flat, +1 long (or leverage allowed in vol targeting)
         """
         raise NotImplementedError

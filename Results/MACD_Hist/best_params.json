@@ -1,0 +1,7 @@
+{
+  "n_short": 8,
+  "n_long": 21,
+  "n_signal": 5,
+  "allow_short": true,
+  "min_hold": 5
+}

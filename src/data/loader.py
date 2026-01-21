@@ -1,21 +1,49 @@
-import pickle
-import pandas as pd
-from pathlib import Path
+from __future__ import annotations
 
-def load_pkl(file_path: Path) -> pd.DataFrame:
-    with open(file_path, "rb") as f:
-        df = pickle.loads(f.read())
-    # Standardisation minimale
-    if "Close" not in df.columns:
-        raise ValueError(f"Missing Close in {file_path}")
-    # assure index datetime
+from pathlib import Path
+import pickle
+import re
+from typing import Optional, Tuple
+
+import pandas as pd
+
+
+DF_RE = re.compile(r"^df_(.+?)_")  # df_<ticker>_...pkl
+
+
+def sanitize(s: str) -> str:
+    # normalise pour comparer tickers "bizarres" vs filenames
+    return (
+        s.replace("^", "")
+         .replace("=F", "_F")
+         .replace("=X", "_X")
+         .replace("=", "_")
+         .replace("/", "_")
+         .replace(".", "_")
+    )
+
+
+def extract_ticker_from_filename(filename: str) -> Optional[str]:
+    m = DF_RE.match(filename)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def load_pickle_df(path: Path) -> pd.DataFrame:
+    with open(path, "rb") as f:
+        obj = pickle.load(f)
+    if not isinstance(obj, pd.DataFrame):
+        raise TypeError(f"{path} does not contain a DataFrame")
+    df = obj.copy()
+    # Ensure datetime index
     if not isinstance(df.index, pd.DatetimeIndex):
+        # try to coerce
         df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
     return df
 
-def list_pkl_files(day_dir: Path) -> list[Path]:
-    return sorted([p for p in day_dir.iterdir() if p.name.startswith("df_") and p.suffix == ".pkl"])
 
-def ticker_from_filename(p: Path) -> str:
-    # df_AMD_20250131_120000.pkl -> AMD
-    return p.name.split("_")[1]
+def ticker_matches(desired: str, from_file: str) -> bool:
+    # match either exact or via sanitize variants
+    return desired == from_file or sanitize(desired) == sanitize(from_file)

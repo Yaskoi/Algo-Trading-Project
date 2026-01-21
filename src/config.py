@@ -1,26 +1,38 @@
+from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
+from typing import List, Optional
 
-BP = 1e-4  # basis-point = 0.0001
 
-@dataclass
+@dataclass(frozen=True)
 class BacktestConfig:
     data_root: Path
-    tickers: list[str]
-    portfolio_tickers: list[str]
-    weights: list[float]
+    results_root: Path
 
-    # Split IS/OOS (en jours)
-    is_ratio: float = 5/6   # ~ 5 mois sur 6
-    timezone: str = "UTC"
+    tickers: List[str]
+    weights: Optional[List[float]] = None
 
-    # Exécution baseline
-    price_col: str = "Close"     # prix utilisé pour exécution
-    allow_short: bool = True
+    is_ratio: float = 5 / 6
 
-    # Risk management (à activer plus tard)
-    use_stoploss: bool = True
-    use_takeprofit: bool = True
+    # fees
+    bp_fee: float = 0.0001
 
-    # Frais
-    bp_fee: float = BP
+    # columns
+    price_col: str = "Close"
+    open_col: str = "Open"
+    high_col: str = "High"
+    low_col: str = "Low"
+
+    # risk (ATR SL/TP)
+    atr_period: int = 14
+    sl_atr: float = 1.5
+    tp_atr: float = 2.0
+
+    # notional
+    unit_size: float = 1.0
+
+    # execution
+    exec_at: str = "next_open"  # "next_open" recommended
+    max_days: Optional[int] = None
+
+    seed: int = 42

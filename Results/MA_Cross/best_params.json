@@ -1,0 +1,5 @@
+{
+  "fast": 30,
+  "slow": 90,
+  "allow_short": true
+}

@@ -1,0 +1,6 @@
+{
+  "window": 120,
+  "target_vol": 0.0015,
+  "max_leverage": 2.0,
+  "allow_short": true
+}

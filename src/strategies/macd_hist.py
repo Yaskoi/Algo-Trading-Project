@@ -1,66 +1,65 @@
+from __future__ import annotations
 import numpy as np
-from .base import Strategy
+from collections import deque
 
-def ema_last(x: np.ndarray, span: int) -> float:
-    """
-    EMA causal, renvoie la dernière valeur (pas de look-ahead).
-    """
-    x = np.asarray(x, dtype=float)
-    if x.size == 0:
-        return float("nan")
-    alpha = 2.0 / (span + 1.0)
-    e = x[0]
-    for v in x[1:]:
-        e = alpha * v + (1.0 - alpha) * e
-    return float(e)
+from src.strategies.base import BaseStrategy
 
-class MACDHistStrategy(Strategy):
-    """
-    MACD Histogram strategy (cours):
-      DIFF_t = EMA_short(Close) - EMA_long(Close)
-      Signal_t = EMA(DIFF, n_signal)
-      Hist_t = DIFF_t - Signal_t
 
-    Rule (simple):
-      long  if Hist_t > eps
-      short if Hist_t < -eps (si allow_short)
-      else flat
+def ema_update(prev: float, x: float, alpha: float) -> float:
+    return alpha * x + (1 - alpha) * prev
 
-    Tout est causal: basé uniquement sur history[:t].
-    """
-    def __init__(self, n_short: int = 12, n_long: int = 26, n_signal: int = 9, eps: float = 0.0, allow_short: bool = True):
-        if n_short >= n_long:
-            raise ValueError("n_short must be < n_long")
+
+class MACDHistStrategy(BaseStrategy):
+    def __init__(self, n_short=12, n_long=26, n_signal=9, allow_short=True, min_hold: int = 5):
         self.n_short = n_short
         self.n_long = n_long
         self.n_signal = n_signal
-        self.eps = float(eps)
         self.allow_short = allow_short
+        self.min_hold = min_hold
 
-    def on_bar(self, t, row, history):
-        close = history["Close"].to_numpy(dtype=float)
-        if close.size < self.n_long + self.n_signal + 5:
+        self.init = False
+        self.ema_s = 0.0
+        self.ema_l = 0.0
+        self.sig = 0.0
+        self.prev_hist = 0.0
+        self.hold = 0
+        self.pos = 0.0
+
+        self.alpha_s = 2 / (n_short + 1)
+        self.alpha_l = 2 / (n_long + 1)
+        self.alpha_sig = 2 / (n_signal + 1)
+
+    def on_bar(self, ts, open_, high, low, close) -> float:
+        x = float(close)
+
+        if not self.init:
+            self.ema_s = x
+            self.ema_l = x
+            self.sig = 0.0
+            self.prev_hist = 0.0
+            self.init = True
             return 0.0
 
-        # Fenêtre suffisante pour stabiliser les EMA
-        m = min(close.size, 5 * self.n_long)
-        window = close[-m:]
+        self.ema_s = ema_update(self.ema_s, x, self.alpha_s)
+        self.ema_l = ema_update(self.ema_l, x, self.alpha_l)
+        macd = self.ema_s - self.ema_l
+        self.sig = ema_update(self.sig, macd, self.alpha_sig)
+        hist = macd - self.sig
 
-        # Série DIFF causale sur window
-        diffs = np.empty_like(window, dtype=float)
-        for i in range(window.size):
-            sub = window[: i + 1]
-            if sub.size < self.n_long:
-                diffs[i] = 0.0
-            else:
-                diffs[i] = ema_last(sub, self.n_short) - ema_last(sub, self.n_long)
+        # cross 0
+        desired = self.pos
+        if self.hold > 0:
+            self.hold -= 1
+            self.prev_hist = hist
+            return desired
 
-        diff_t = diffs[-1]
-        signal_t = ema_last(diffs, self.n_signal)
-        hist_t = diff_t - signal_t
+        if self.prev_hist <= 0 and hist > 0:
+            desired = 1.0
+            self.hold = self.min_hold
+        elif self.prev_hist >= 0 and hist < 0:
+            desired = -1.0 if self.allow_short else 0.0
+            self.hold = self.min_hold
 
-        if hist_t > self.eps:
-            return 1.0
-        if hist_t < -self.eps:
-            return -1.0 if self.allow_short else 0.0
-        return 0.0
+        self.prev_hist = hist
+        self.pos = desired
+        return desired
