@@ -241,39 +241,31 @@ class RiskManager:
          "volatility" : size = target_vol / realised_intraday_vol
                         where realised_vol is the std of log-returns over
                         the rolling buffer of closes seen so far today + history.
-                        Intuition: reduce size when the market is choppy,
-                        increase it when it is calm.
 
          "atr"        : size = target_vol / (ATR / price)
                         where ATR = mean(high - low) over atr_period bars.
-                        Intuition: normalise position size by the typical
-                        intraday range so each trade risks roughly the same
-                        amount regardless of the instrument's volatility regime.
 
        In all cases size is capped at max_position.
 
     2. Stop-loss
        If the adverse move from entry price >= stop_loss (fraction), force flat.
-       Example: stop_loss=0.005 exits if price moves 0.5% against the position.
 
     3. Take-profit
        If the favourable move from entry price >= take_profit (fraction), force flat.
-       Example: take_profit=0.01 exits when the position is up 1%.
 
     4. Daily loss limit
        Once the cumulative net P&L for the day (normalised by first close)
        breaches -daily_loss_limit, all signals are forced to 0 for the rest
        of that day.
-       Example: daily_loss_limit=0.02 halts trading after a 2% daily loss.
 
     All parameters come from Config. Setting a parameter to None disables it.
 
-    State keys managed (injected into the mutable state dict)
-    ---------------------------------------------------------
-    _rm_entry_price  : float — price at which the current position was opened
-    _rm_halted       : bool  — True once daily loss limit is breached
-    _rm_vol_buffer   : list  — rolling close prices for vol estimation
-    _rm_atr_buffer   : list  — rolling (high - low) values for ATR estimation
+    State keys managed
+    ------------------
+    _rm_entry_price  : float
+    _rm_halted       : bool
+    _rm_vol_buffer   : list
+    _rm_atr_buffer   : list
     """
 
     def __init__(self, cfg: Config):
@@ -285,13 +277,9 @@ class RiskManager:
         self.take_profit = cfg.take_profit
         self.daily_limit = cfg.daily_loss_limit
 
-    # ── public API ────────────────────────────────────────────────────────
-
     def on_day_start(self, state: dict) -> None:
-        """Reset intraday risk counters. Called before the first bar of each day."""
         state["_rm_halted"]      = False
         state["_rm_entry_price"] = 0.0
-        # vol / ATR buffers persist across days (rolling estimates need history)
         state.setdefault("_rm_vol_buffer", [])
         state.setdefault("_rm_atr_buffer", [])
 
@@ -304,25 +292,8 @@ class RiskManager:
         day_net_pnl:  float,
         first_close:  float,
     ) -> float:
-        """
-        Apply all risk filters and return the final sized position.
-
-        Parameters
-        ----------
-        raw_signal   : direction from strategy {-1, 0, +1}
-        position     : current live position (float)
-        bar          : current OHLCV bar as pd.Series
-        state        : mutable intraday state dict
-        day_net_pnl  : cumulative net P&L so far today (in price units)
-        first_close  : first close of the day (used as normalisation base)
-
-        Returns
-        -------
-        float — desired position for this bar
-        """
         price = bar["close"]
 
-        # update rolling buffers with current bar
         state["_rm_vol_buffer"].append(price)
         state["_rm_atr_buffer"].append(bar["high"] - bar["low"])
 
@@ -335,44 +306,32 @@ class RiskManager:
         if state["_rm_halted"]:
             return 0.0
 
-        # ── 2. stop-loss / take-profit on existing position ───────────────
+        # ── 2. stop-loss / take-profit ────────────────────────────────────
         if position != 0 and state["_rm_entry_price"] > 0:
             move     = (price - state["_rm_entry_price"]) / state["_rm_entry_price"]
-            pnl_frac = position * move     # positive = profit direction
+            pnl_frac = position * move
 
             if self.stop_loss is not None and pnl_frac <= -self.stop_loss:
-                return 0.0               # stop triggered
+                return 0.0
 
             if self.take_profit is not None and pnl_frac >= self.take_profit:
-                return 0.0              # target reached
+                return 0.0
 
-        # ── flat signal → nothing to size ─────────────────────────────────
         if raw_signal == 0:
             return 0.0
 
         # ── 3. trade sizing ───────────────────────────────────────────────
         size = self._compute_size(bar, state)
 
-        # update entry price when opening or reversing
         if raw_signal != 0 and raw_signal != int(np.sign(position)):
             state["_rm_entry_price"] = price
 
         return float(raw_signal) * size
 
     def on_position_closed(self, state: dict) -> None:
-        """Reset entry price when position returns to zero."""
         state["_rm_entry_price"] = 0.0
 
-    # ── private ───────────────────────────────────────────────────────────
-
     def _compute_size(self, bar: pd.Series, state: dict) -> float:
-        """
-        Compute position size in (0, max_position].
-
-        fixed      -> max_position (constant, simplest)
-        volatility -> target_vol / realised_vol  (vol-targeting)
-        atr        -> target_vol / (ATR / price) (range-normalised sizing)
-        """
         if self.method == "fixed":
             return self.max_pos
 
@@ -413,20 +372,23 @@ class ExecutionEngine:
     """
     Executes trades bar-by-bar and computes gross / net P&L.
 
-    Accepts float position sizes (from RiskManager).
+    Fee model
+    ---------
+        fee_close  = |position|  * bp * (entry_price + price_now)
+        fee_open   = |desired|   * bp * (price_now   + price_next)
 
-    Fee model (project spec)
-    ------------------------
-        total_fees += |position| * basis_point * (S_start + S_end)
-
-        S_start = entry price of the position being closed
-        S_end   = current close price
-        Applied separately on closing and opening legs for reversals.
+        price_next : open price of the next bar (realistic round-trip estimate).
+                     Falls back to price_now if unavailable.
 
     P&L model
     ---------
-        gross_pnl_bar = position_{t-1} * (close_t - close_{t-1})
+        gross_pnl_bar = position_{t-1} * (price_now - price_prev)
         net_pnl_bar   = gross_pnl_bar  - fee_this_bar
+
+    Execution timing
+    ----------------
+        Decision made on close of bar t  →  executed at open of bar t+1.
+        This is enforced by the Backtester (_replay loop with pending_desired).
     """
 
     def __init__(self, cfg: Config):
@@ -439,6 +401,7 @@ class ExecutionEngine:
         price_now:   float,
         price_prev:  float,
         entry_price: float,
+        price_next:  float = None,   # open of next bar for realistic fee estimate
     ) -> Tuple[float, float, float, float, float]:
         """
         Returns
@@ -451,10 +414,13 @@ class ExecutionEngine:
         new_entry = entry_price
 
         if desired != position:
+            # closing leg
             if position != 0:
                 fee += abs(position) * self.bp * (entry_price + price_now)
+            # opening leg
             if desired != 0:
-                fee += abs(desired) * self.bp * (price_now + price_now)
+                p_next    = price_next if price_next is not None else price_now
+                fee      += abs(desired) * self.bp * (price_now + p_next)
                 new_entry = price_now
             else:
                 new_entry = 0.0
@@ -472,21 +438,18 @@ class Backtester:
 
     Pipeline
     --------
-    1. Load data  ->  DataLoader
-    2. IS / OOS split  (no overlap, strictly chronological)
+    1. Load data         ->  DataLoader
+    2. IS / OOS split        (strictly chronological, no overlap)
     3. strategy.fit(df_is)
-    4. _replay(df_is,  "IS")   -- diagnostic
-    5. _replay(df_oos, "OOS")  -- official evaluation
+    4. _replay(df_is,  "IS")    diagnostic
+    5. _replay(df_oos, "OOS")   official evaluation
 
-    Bar-by-bar loop (strictly causal, no look-ahead)
-    ------------------------------------------------
-    For each bar:
-        strategy.generate_signal()  ->  {-1, 0, +1}   direction
-                  |
-        RiskManager.process()       ->  float size
-          (stop-loss / take-profit / daily limit / sizing method)
-                  |
-        ExecutionEngine.execute()   ->  gross / net P&L with fees
+    Bar-by-bar loop — strictly causal
+    ----------------------------------
+    Bar t  : strategy.generate_signal()  ->  pending_desired
+    Bar t+1: ExecutionEngine.execute()   ->  executed at open(t+1)
+
+    This one-bar delay eliminates execution-on-signal look-ahead bias.
     """
 
     def __init__(self, cfg: Config, strategy: BaseStrategy):
@@ -518,38 +481,54 @@ class Backtester:
             if len(day_df) < 2:
                 continue
 
-            state       = {}
-            position    = 0.0
-            entry_price = 0.0
-            day_gross   = 0.0
-            day_net     = 0.0
-            day_fees    = 0.0
-            n_trades    = 0
-            first_close  = day_df["close"].iloc[0]
-            day_open_ref = prev_day_close if prev_day_close is not None else first_close
+            state           = {}
+            position        = 0.0
+            entry_price     = 0.0
+            day_gross       = 0.0
+            day_net         = 0.0
+            day_fees        = 0.0
+            n_trades        = 0
+            first_close     = day_df["close"].iloc[0]
+            day_open_ref    = prev_day_close if prev_day_close is not None else first_close
+            pending_desired = 0.0   # signal decided on bar t, executed at open of bar t+1
 
             self.strategy.on_day_start(date, state)
-            self.risk.on_day_start(state)           # reset daily risk counters
+            self.risk.on_day_start(state)
 
             bars = list(day_df.itertuples())
 
             for i, bar in enumerate(bars):
-                price_now  = bar.close
                 price_prev = bars[i - 1].close if i > 0 else day_open_ref
+                price_next = bars[i + 1].close if i < len(bars) - 1 else bar.close
 
-                # force flat on last bar (no overnight position)
+                # ── Execute pending order at open of current bar ──────────
+                if i > 0:
+                    if pending_desired == 0.0 and position != 0.0:
+                        self.risk.on_position_closed(state)
+
+                    position, gross, net, fee, entry_price = self.engine.execute(
+                        pending_desired, position, bar.open, price_prev, entry_price, price_next
+                    )
+                    day_gross += gross
+                    day_net   += net
+                    day_fees  += fee
+                    if fee > 0:
+                        n_trades += 1
+
+                # ── Decide signal on close of current bar ─────────────────
                 if i == len(bars) - 1:
-                    desired = 0.0
+                    # force flat — no overnight positions
+                    pending_desired = 0.0
                 else:
                     bar_series = pd.Series(
                         {"open": bar.open, "high": bar.high,
                          "low": bar.low, "close": bar.close, "volume": bar.volume},
                         name=bar.Index,
                     )
-                    raw_signal = self.strategy.validate_signal(
+                    raw_signal      = self.strategy.validate_signal(
                         self.strategy.generate_signal(bar_series, state)
                     )
-                    desired = self.risk.process(
+                    pending_desired = self.risk.process(
                         raw_signal  = raw_signal,
                         position    = position,
                         bar         = bar_series,
@@ -557,20 +536,6 @@ class Backtester:
                         day_net_pnl = day_net,
                         first_close = first_close,
                     )
-
-                # reset entry price when going flat
-                if desired == 0.0 and position != 0.0:
-                    self.risk.on_position_closed(state)
-
-                position, gross, net, fee, entry_price = self.engine.execute(
-                    desired, position, price_now, price_prev, entry_price
-                )
-
-                day_gross += gross
-                day_net   += net
-                day_fees  += fee
-                if fee > 0:
-                    n_trades += 1
 
             self.strategy.on_day_end(date, state)
             prev_day_close = day_df["close"].iloc[-1]
@@ -643,9 +608,9 @@ class PortfolioEngine:
 
 class PerformanceReporter:
     """
-    Computes and displays the OOS performance matrix (project spec):
+    Computes and displays the OOS performance matrix:
 
-    | Asset     | Net Return | Ann. Sharpe | Max DD | Avg Daily Trades |
+    | Asset | Net Return | Ann. Sharpe | Max DD | Avg Daily Trades |
     """
 
     TRADING_DAYS = 252
@@ -657,6 +622,7 @@ class PerformanceReporter:
             "net_return": self._annualised_return(r),
             "sharpe":     self._annualised_sharpe(r),
             "max_dd":     self._max_drawdown(r),
+            "calmar":     self._calmar_ratio(r),
             "avg_trades": daily["n_trades"].mean(),
         }
 
@@ -674,10 +640,17 @@ class PerformanceReporter:
         cum  = (1 + r).cumprod()
         peak = cum.cummax()
         return ((cum - peak) / peak).min()
+    
+    def _calmar_ratio(self, r: pd.Series) -> float:
+        ann_return = self._annualised_return(r)
+        max_dd     = self._max_drawdown(r)
+        if max_dd == 0:
+            return 0.0
+        return ann_return / abs(max_dd)
 
     def print_table(self, rows: List[dict]) -> None:
         header = (f"{'Asset':<14} {'Net Return':>11} {'Ann. Sharpe':>12} "
-                  f"{'Max DD':>8} {'Avg Daily Trades':>17}")
+                f"{'Calmar':>8} {'Max DD':>8} {'Avg Daily Trades':>17}")
         sep = "-" * len(header)
         print(f"\n{sep}\n{header}\n{sep}")
         for row in rows:
@@ -687,6 +660,7 @@ class PerformanceReporter:
                 f"{name:<14} "
                 f"{row['net_return']*100:>10.2f}% "
                 f"{row['sharpe']:>12.2f} "
+                f"{row['calmar']:>8.2f} "
                 f"{row['max_dd']*100:>7.2f}% "
                 f"{row['avg_trades']:>17.1f}"
             )
@@ -711,13 +685,13 @@ class PerformanceReporter:
             fees   = df["fees"].copy() if "fees" in df.columns else (g - r)
             trades = df["n_trades"].copy()
 
-            cum_gross = (1 + g).cumprod() - 1
-            cum_net   = (1 + r).cumprod() - 1
-            peak      = (1 + r).cumprod().cummax()
-            drawdown  = ((1 + r).cumprod() - peak) / peak
-            daily_vol = r.rolling(20, min_periods=2).std() * np.sqrt(self.TRADING_DAYS)
-            roll_mean = r.rolling(20, min_periods=2).mean()
-            roll_std  = r.rolling(20, min_periods=2).std()
+            cum_gross      = (1 + g).cumprod() - 1
+            cum_net        = (1 + r).cumprod() - 1
+            peak           = (1 + r).cumprod().cummax()
+            drawdown       = ((1 + r).cumprod() - peak) / peak
+            daily_vol      = r.rolling(20, min_periods=2).std() * np.sqrt(self.TRADING_DAYS)
+            roll_mean      = r.rolling(20, min_periods=2).mean()
+            roll_std       = r.rolling(20, min_periods=2).std()
             rolling_sharpe = (roll_mean / roll_std.replace(0, np.nan)) * np.sqrt(self.TRADING_DAYS)
 
             log = pd.DataFrame({
@@ -788,22 +762,47 @@ class PerformanceReporter:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def run_backtest(
-    strategy: BaseStrategy,
-    cfg:      Config,
+    strategy,          # BaseStrategy  OR  Dict[str, BaseStrategy]
+    cfg: Config,
 ) -> Dict[str, pd.DataFrame]:
+    """
+    Main entry point.
+
+    Parameters
+    ----------
+    strategy : BaseStrategy or dict[ticker -> BaseStrategy]
+        Pass a dict to use a different strategy per ticker (e.g. pair trading
+        on some tickers, momentum on others).
+    cfg : Config
+
+    Returns
+    -------
+    dict with keys: tickers, oos, portfolio, metrics, trading_log
+    """
 
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
 
-    backtester = Backtester(cfg, strategy)
-    portfolio  = PortfolioEngine(cfg)
-    reporter   = PerformanceReporter()
+    portfolio = PortfolioEngine(cfg)
+    reporter  = PerformanceReporter()
 
+    # ── Resolve ticker -> strategy mapping ───────────────────────────────
+    if isinstance(strategy, dict):
+        strategy_map = strategy
+    else:
+        strategy_map = {t: strategy for t in cfg.tickers}
+
+    # ── Run backtester per ticker ─────────────────────────────────────────
     all_daily: Dict[str, pd.DataFrame] = {}
 
     for ticker in cfg.tickers:
         print(f"\n{'='*60}\n  {ticker}\n{'='*60}")
+        strat = strategy_map.get(ticker)
+        if strat is None:
+            print(f"  [run_backtest] No strategy for {ticker}, skipping.")
+            continue
         try:
-            all_daily[ticker] = backtester.run(ticker)
+            bt = Backtester(cfg, strat)
+            all_daily[ticker] = bt.run(ticker)
         except FileNotFoundError as e:
             print(f"  [run_backtest] Skipping {ticker} - {e}")
         except ValueError as e:
@@ -812,6 +811,7 @@ def run_backtest(
     if not all_daily:
         raise RuntimeError("[run_backtest] No ticker could be loaded. Check data_dir.")
 
+    # ── OOS only for portfolio & metrics ─────────────────────────────────
     oos_daily = {
         t: df[df["period"] == "OOS"]
         for t, df in all_daily.items()
@@ -820,16 +820,19 @@ def run_backtest(
 
     port_daily = portfolio.combine(oos_daily)
 
+    # ── Performance table ─────────────────────────────────────────────────
     rows = [reporter.compute_metrics(df, t) for t, df in oos_daily.items()]
     rows.append(reporter.compute_metrics(port_daily, "Portfolio"))
     reporter.print_table(rows)
 
+    # ── Export CSVs ───────────────────────────────────────────────────────
     for ticker, df in all_daily.items():
         safe_name = ticker.replace("^", "").replace("=", "_")
         df.to_csv(Path(cfg.output_dir) / f"{safe_name}_daily.csv")
     port_daily.to_csv(Path(cfg.output_dir) / "portfolio_daily.csv")
     print(f"\n[run_backtest] CSVs saved -> {cfg.output_dir}/")
 
+    # ── Trading log + equity curves ───────────────────────────────────────
     trading_log = reporter.export_trading_log(oos_daily, port_daily, cfg.output_dir)
 
     if cfg.plot:
